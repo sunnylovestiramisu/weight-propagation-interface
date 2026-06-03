@@ -232,3 +232,8 @@ patches:
 #     fieldPath: .metadata.name
 #   targets: # Do not remove or uncomment the following scaffold marker; required to generate code for target CRD.
 # +kubebuilder:scaffold:crdkustomizecainjectionname
+
+images:
+- name: controller
+  newName: us-docker.pkg.dev/songsunny-gke-dev2/wpi/wpi-operator
+  newTag: wpi-sharding-1
