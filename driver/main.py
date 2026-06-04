@@ -9,6 +9,7 @@ import socket
 import threading
 import array
 import ctypes
+import mmap
 
 try:
     import cupy
@@ -154,11 +155,19 @@ except Exception as e:
     logger.warning(f"Could not initialize CudaAllocator (fallback to mock): {e}")
 
 MOUNT_PATH = "/dev/wpi/weights"
-SOCKET_DIR = "/run/wpi/sockets"
+SOCKET_DIR = os.environ.get("WPI_SOCKET_DIR", "/run/wpi/sockets")
 FILE_SIZE_GIB = 10
 
 ALLOCATED_BUFFERS = {}  # mapping: buffer_id -> {"device_ptr": device_ptr, "size_bytes": size_bytes, "ref_count": int}
 KNOWN_CLAIMS = {}       # mapping: claim_id -> buffer_id
+
+DRIVER_BACKEND = os.environ.get("WPI_BACKEND")
+if not DRIVER_BACKEND:
+    if os.path.exists("/dev/accel0"):
+        DRIVER_BACKEND = "tpu"
+    else:
+        DRIVER_BACKEND = "cuda"
+logger.info(f"WPI Driver starting in {DRIVER_BACKEND.upper()} backend mode")
 
 def start_nccl_target_server():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -281,6 +290,7 @@ def handle_target_connection(conn, addr):
             recv_bytes = scatter_length if (mode == 1 and scatter_length > 0) else size_bytes
             bandwidth_gbps = (recv_bytes / (1024**3)) / duration if duration > 0 else 0
             logger.info(f"Target NCCL {mode_str} recv complete in {duration:.4f}s. Bandwidth: {bandwidth_gbps:.2f} GB/s")
+            info["ready"] = True
             
             # Notify all local consumers that rely on this buffer
             notify_sockets = info.get("notify_sockets", [])
@@ -407,7 +417,8 @@ def pass_fd_server(sock_path: str, buffer_id: str):
                             "fd": new_fd,
                             "size_bytes": size_bytes,
                             "gpu_id": target_gpu,
-                            "notify_sockets": []
+                            "notify_sockets": [],
+                            "ready": True,
                         }
                         fd_to_send = new_fd
                         logger.info(f"Relocation: Stored relocated buffer as {relocate_key}")
@@ -451,15 +462,134 @@ def notify_server(sock_path: str, buffer_id: str):
             conn, addr = server.accept()
             logger.info(f"Consumer connected to notify socket {sock_path}.")
             if buffer_id in ALLOCATED_BUFFERS:
-                if "notify_sockets" not in ALLOCATED_BUFFERS[buffer_id]:
-                    ALLOCATED_BUFFERS[buffer_id]["notify_sockets"] = []
-                ALLOCATED_BUFFERS[buffer_id]["notify_sockets"].append(conn)
+                info = ALLOCATED_BUFFERS[buffer_id]
+                if "notify_sockets" not in info:
+                    info["notify_sockets"] = []
+                info["notify_sockets"].append(conn)
+                if info.get("ready", False):
+                    try:
+                        conn.sendall(b"READY\n")
+                        logger.info("Notify server: Sent READY notification to consumer immediately on connection.")
+                    except Exception as e:
+                        logger.warning(f"Notify server: Failed to send immediate READY: {e}")
             else:
                 logger.error(f"Cannot accept notify connection: buffer {buffer_id} not active.")
                 conn.close()
         except Exception as e:
             logger.error(f"Error accepting notify connection: {e}")
             break
+def push_tpu_chunk(target_ip: str, buffer_id: str, src_offset: int, dst_offset: int, length: int, source_fd: int):
+    """Push weight chunk from source_fd (at src_offset) to target_ip (at dst_offset) over TCP."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((target_ip, 50053))
+        
+        # Send header: "buffer_id\ndst_offset\nlength\n\n"
+        header = f"{buffer_id}\n{dst_offset}\n{length}\n\n".encode('utf-8')
+        s.sendall(header)
+        
+        resp = s.recv(1024)
+        if b"OK" not in resp:
+            raise Exception(f"Target rejected transfer: {resp.decode('utf-8')}")
+            
+        sent = 0
+        while sent < length:
+            to_send = min(4 * 1024 * 1024, length - sent)
+            data = os.pread(source_fd, to_send, src_offset + sent)
+            if not data:
+                break
+            s.sendall(data)
+            sent += len(data)
+            
+        if sent != length:
+            raise Exception(f"Transfer incomplete: sent {sent}/{length} bytes")
+            
+        logger.info(f"TPU Push Client: pushed {sent} bytes to {target_ip} (dst_offset={dst_offset})")
+    except Exception as e:
+        logger.error(f"TPU Push Client failed for target {target_ip}: {e}")
+        raise
+    finally:
+        s.close()
+
+def handle_incoming_tpu_data(conn, addr):
+    try:
+        header = b""
+        while b"\n\n" not in header:
+            chunk = conn.recv(1024)
+            if not chunk:
+                break
+            header += chunk
+            
+        if not header:
+            return
+            
+        parts = header.split(b"\n")
+        buffer_id = parts[0].decode('utf-8')
+        dst_offset = int(parts[1])
+        length = int(parts[2])
+        
+        logger.info(f"TPU Receiver: receiving {length} bytes for {buffer_id} at offset {dst_offset} from {addr}")
+        
+        if buffer_id not in ALLOCATED_BUFFERS:
+            logger.error(f"TPU Receiver: buffer {buffer_id} not found!")
+            conn.sendall(b"ERROR: Buffer not found\n")
+            return
+            
+        info = ALLOCATED_BUFFERS[buffer_id]
+        fd = info["fd"]
+        
+        send_pre_update_signal(buffer_id)
+        
+        conn.sendall(b"OK\n")
+        
+        received = 0
+        while received < length:
+            chunk = conn.recv(min(4 * 1024 * 1024, length - received))
+            if not chunk:
+                break
+            os.pwrite(fd, chunk, dst_offset + received)
+            received += len(chunk)
+            
+        if received != length:
+            logger.error(f"TPU Receiver: incomplete transfer for {buffer_id}, got {received}/{length} bytes")
+            return
+            
+        logger.info(f"TPU Receiver: successfully wrote {received} bytes for {buffer_id}")
+        info["ready"] = True
+        
+        notify_sockets = info.get("notify_sockets", [])
+        broken_sockets = []
+        for s in notify_sockets:
+            try:
+                s.sendall(b"READY\n")
+                logger.info("TPU Receiver: Sent READY notification to consumer.")
+            except Exception as e:
+                logger.warning(f"TPU Receiver: Failed to notify consumer: {e}")
+                broken_sockets.append(s)
+        for s in broken_sockets:
+            if s in notify_sockets:
+                notify_sockets.remove(s)
+                
+    except Exception as e:
+        logger.error(f"TPU Receiver error: {e}")
+    finally:
+        conn.close()
+
+def start_tpu_receiver_server():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    port = 50053
+    server.bind(("0.0.0.0", port))
+    server.listen(100)
+    logger.info(f"WPI TPU Receiver Server listening on 0.0.0.0:50053")
+    while True:
+        try:
+            conn, addr = server.accept()
+            t = threading.Thread(target=handle_incoming_tpu_data, args=(conn, addr), daemon=True)
+            t.start()
+        except Exception as e:
+            logger.error(f"Error accepting receiver connection: {e}")
+
 
 class NodeService(wpi_pb2_grpc.NodeServiceServicer):
     def NodeStageWeight(self, request, context):
@@ -496,89 +626,140 @@ class NodeService(wpi_pb2_grpc.NodeServiceServicer):
                 logger.warning(f"No size_bytes provided by Operator for {effective_buffer_id}, falling back to 10GiB")
                 weight_size_bytes = 10 * 1024 * 1024 * 1024
 
-            if cuda_allocator:
-                gpu_id = 0
-                if is_sharded:
-                    try:
-                        num_gpus = cupy.cuda.runtime.getDeviceCount()
-                        gpu_id = shard_index % num_gpus
-                    except Exception:
-                        pass
-                
-                logger.info(f"Setting CUDA context in current thread for GPU {gpu_id}...")
-                gpu_ctx = cuda_allocator.get_or_create_context(gpu_id)
-                cuda_allocator.libcuda.cuCtxSetCurrent(gpu_ctx)
-
-                logger.info(f"Using CUDA to allocate {weight_size_bytes} bytes for {effective_buffer_id} on GPU {gpu_id}...")
-                fd, handle, device_ptr = cuda_allocator.allocate_and_export(weight_size_bytes, gpu_id)
-                logger.info(f"CUDA alloc successful. Exported FD: {fd}, handle: {handle}, mapped device_ptr: {device_ptr}")
+            if DRIVER_BACKEND == "tpu":
+                shm_path = f"/dev/shm/wpi-{effective_buffer_id}"
+                logger.info(f"TPU Stage: Allocating shared memory file {shm_path} ({weight_size_bytes} bytes)...")
+                try:
+                    os.makedirs(os.path.dirname(shm_path), exist_ok=True)
+                    with open(shm_path, "wb") as f:
+                        f.truncate(weight_size_bytes)
+                    os.chmod(shm_path, 0o777)
+                    
+                    fd = os.open(shm_path, os.O_RDWR)
+                    mapped_mem = mmap.mmap(fd, weight_size_bytes, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+                except Exception as e:
+                    logger.error(f"TPU Stage failed: {e}")
+                    context.abort(grpc.StatusCode.INTERNAL, f"Failed to allocate shared memory: {e}")
+                    return wpi_pb2.NodeStageWeightResponse()
                 
                 ALLOCATED_BUFFERS[effective_buffer_id] = {
-                    "device_ptr": device_ptr,
+                    "fd": fd,
+                    "shm_path": shm_path,
+                    "mapped_mem": mapped_mem,
                     "size_bytes": weight_size_bytes,
                     "source_path": source_path,
-                    "handle": handle,
-                    "fd": fd,
                     "notify_sockets": [],
                     "ref_count": 1,
-                    "gpu_id": gpu_id,
                     "shard_index": shard_index if is_sharded else -1,
                     "total_shards": total_shards if is_sharded else 0,
                     "parent_buffer": request.buffer_id,
+                    "ready": False,
                 }
                 
                 if source_path:
                     if os.path.exists(source_path):
-                        logger.info(f"Loading real weights from {source_path} into VRAM...")
+                        logger.info(f"Loading real weights from {source_path} into shared memory...")
                         try:
                             from safetensors import safe_open
-                            import torch 
-                            
-                            # Use safetensors to quickly parse the header and get the tensor data
-                            # We use cupy to zero-copy map the device_ptr and load the bytes into it
-                            mem = cupy.cuda.UnownedMemory(device_ptr, weight_size_bytes, None)
-                            memptr = cupy.cuda.MemoryPointer(mem, 0)
-                            
-                            # Flat array representation of the entire VRAM block
-                            num_elements = weight_size_bytes // 2 # Assuming float16
-                            device_array = cupy.ndarray((num_elements,), dtype=cupy.float16, memptr=memptr)
-                            
-                            # Safetensors reading
                             with safe_open(source_path, framework="pt", device="cpu") as f:
                                 offset = 0
                                 for key in f.keys():
                                     tensor = f.get_tensor(key)
-                                    # Flatten and cast to cupy to copy to VRAM
-                                    # We copy chunk by chunk into the linearly mapped VRAM
-                                    elements = tensor.numel()
-                                    src_ptr = tensor.data_ptr()
-                                    dst_ptr = device_array.data.ptr + (offset * 2) # float16 is 2 bytes
-                                    
-                                    # Use direct HostToDevice memory copy to bypass cupy.asarray allocation
-                                    cupy.cuda.runtime.memcpy(
-                                        dst_ptr,
-                                        src_ptr,
-                                        elements * 2,
-                                        cupy.cuda.runtime.memcpyHostToDevice
-                                    )
-                                    offset += elements
-                                    
-                            logger.info(f"Successfully loaded safetensors from {source_path} into VRAM!")
+                                    arr_bytes = tensor.numpy().tobytes()
+                                    mapped_mem[offset:offset+len(arr_bytes)] = arr_bytes
+                                    offset += len(arr_bytes)
+                            logger.info(f"Successfully loaded safetensors into shared memory!")
+                            ALLOCATED_BUFFERS[effective_buffer_id]["ready"] = True
                         except Exception as e:
-                            logger.error(f"Failed to load safetensors from {source_path}: {e}")
+                            logger.error(f"Failed to load safetensors: {e}")
                             context.abort(grpc.StatusCode.INTERNAL, f"Failed to load safetensors: {e}")
+                            return wpi_pb2.NodeStageWeightResponse()
                     else:
                         msg = f"Source path {source_path} specified but does not exist!"
                         logger.error(msg)
                         context.abort(grpc.StatusCode.NOT_FOUND, msg)
                         return wpi_pb2.NodeStageWeightResponse()
                 else:
-                    logger.info("No source_path specified. Allocating empty VRAM buffer locally without disk load.")
+                    logger.info("No source_path specified. Allocating empty shared memory locally.")
             else:
-                msg = "CUDA allocator failed to initialize. Cannot allocate VRAM."
-                logger.error(msg)
-                context.abort(grpc.StatusCode.UNAVAILABLE, msg)
-                return wpi_pb2.NodeStageWeightResponse()
+                if cuda_allocator:
+                    gpu_id = 0
+                    if is_sharded:
+                        try:
+                            num_gpus = cupy.cuda.runtime.getDeviceCount()
+                            gpu_id = shard_index % num_gpus
+                        except Exception:
+                            pass
+                    
+                    logger.info(f"Setting CUDA context in current thread for GPU {gpu_id}...")
+                    gpu_ctx = cuda_allocator.get_or_create_context(gpu_id)
+                    cuda_allocator.libcuda.cuCtxSetCurrent(gpu_ctx)
+
+                    logger.info(f"Using CUDA to allocate {weight_size_bytes} bytes for {effective_buffer_id} on GPU {gpu_id}...")
+                    fd, handle, device_ptr = cuda_allocator.allocate_and_export(weight_size_bytes, gpu_id)
+                    logger.info(f"CUDA alloc successful. Exported FD: {fd}, handle: {handle}, mapped device_ptr: {device_ptr}")
+                    
+                    ALLOCATED_BUFFERS[effective_buffer_id] = {
+                        "device_ptr": device_ptr,
+                        "size_bytes": weight_size_bytes,
+                        "source_path": source_path,
+                        "handle": handle,
+                        "fd": fd,
+                        "notify_sockets": [],
+                        "ref_count": 1,
+                        "gpu_id": gpu_id,
+                        "shard_index": shard_index if is_sharded else -1,
+                        "total_shards": total_shards if is_sharded else 0,
+                        "parent_buffer": request.buffer_id,
+                        "ready": False,
+                    }
+                    
+                    if source_path:
+                        if os.path.exists(source_path):
+                            logger.info(f"Loading real weights from {source_path} into VRAM...")
+                            try:
+                                from safetensors import safe_open
+                                import torch 
+                                
+                                mem = cupy.cuda.UnownedMemory(device_ptr, weight_size_bytes, None)
+                                memptr = cupy.cuda.MemoryPointer(mem, 0)
+                                
+                                num_elements = weight_size_bytes // 2
+                                device_array = cupy.ndarray((num_elements,), dtype=cupy.float16, memptr=memptr)
+                                
+                                with safe_open(source_path, framework="pt", device="cpu") as f:
+                                    offset = 0
+                                    for key in f.keys():
+                                        tensor = f.get_tensor(key)
+                                        elements = tensor.numel()
+                                        src_ptr = tensor.data_ptr()
+                                        dst_ptr = device_array.data.ptr + (offset * 2)
+                                        
+                                        cupy.cuda.runtime.memcpy(
+                                            dst_ptr,
+                                            src_ptr,
+                                            elements * 2,
+                                            cupy.cuda.runtime.memcpyHostToDevice
+                                        )
+                                        offset += elements
+                                        
+                                logger.info(f"Successfully loaded safetensors from {source_path} into VRAM!")
+                                ALLOCATED_BUFFERS[effective_buffer_id]["ready"] = True
+                            except Exception as e:
+                                logger.error(f"Failed to load safetensors from {source_path}: {e}")
+                                context.abort(grpc.StatusCode.INTERNAL, f"Failed to load safetensors: {e}")
+                        else:
+                            msg = f"Source path {source_path} specified but does not exist!"
+                            logger.error(msg)
+                            context.abort(grpc.StatusCode.NOT_FOUND, msg)
+                            return wpi_pb2.NodeStageWeightResponse()
+                    else:
+                        logger.info("No source_path specified. Allocating empty VRAM buffer locally without disk load.")
+                else:
+                    msg = "CUDA allocator failed to initialize. Cannot allocate VRAM."
+                    logger.error(msg)
+                    context.abort(grpc.StatusCode.UNAVAILABLE, msg)
+                    return wpi_pb2.NodeStageWeightResponse()
             
             # Start background FD-passing server using effective (shard-scoped) buffer ID
             sock_path = os.path.join(SOCKET_DIR, f"{effective_buffer_id}.sock")
@@ -614,33 +795,44 @@ class NodeService(wpi_pb2_grpc.NodeServiceServicer):
                 
                 if info["ref_count"] <= 0:
                     logger.info(f"Ref count for {buffer_id} is 0. Freeing all related allocations...")
-                    
-                    relocated_keys = [k for k in ALLOCATED_BUFFERS.keys() if k.startswith(f"{buffer_id}_gpu")]
-                    all_to_free = [(buffer_id, info)] + [(k, ALLOCATED_BUFFERS[k]) for k in relocated_keys]
-                    
-                    for k, item in all_to_free:
-                        if cuda_allocator and "handle" in item and "device_ptr" in item:
-                            gpu_id = item.get("gpu_id", 0)
-                            logger.info(f"Setting CUDA context to free {k} on GPU {gpu_id}...")
-                            try:
-                                gpu_ctx = cuda_allocator.get_or_create_context(gpu_id)
-                                cuda_allocator.libcuda.cuCtxSetCurrent(gpu_ctx)
-                                cuda_allocator.free(item["handle"], item["device_ptr"], item["size_bytes"])
-                                logger.info(f"Successfully freed {k} on GPU {gpu_id}")
-                            except Exception as e:
-                                logger.error(f"Failed to free allocation {k} on GPU {gpu_id}: {e}")
-                                
-                            if "fd" in item:
+                    if DRIVER_BACKEND == "tpu":
+                        try:
+                            if "mapped_mem" in info:
+                                info["mapped_mem"].close()
+                            if "fd" in info:
+                                os.close(info["fd"])
+                            if "shm_path" in info and os.path.exists(info["shm_path"]):
+                                os.remove(info["shm_path"])
+                            logger.info(f"Successfully freed shared memory buffer {buffer_id}")
+                        except Exception as e:
+                            logger.error(f"Failed to free shared memory buffer {buffer_id}: {e}")
+                        ALLOCATED_BUFFERS.pop(buffer_id, None)
+                    else:
+                        relocated_keys = [k for k in ALLOCATED_BUFFERS.keys() if k.startswith(f"{buffer_id}_gpu")]
+                        all_to_free = [(buffer_id, info)] + [(k, ALLOCATED_BUFFERS[k]) for k in relocated_keys]
+                        
+                        for k, item in all_to_free:
+                            if cuda_allocator and "handle" in item and "device_ptr" in item:
+                                gpu_id = item.get("gpu_id", 0)
+                                logger.info(f"Setting CUDA context to free {k} on GPU {gpu_id}...")
                                 try:
-                                    os.close(item["fd"])
-                                except OSError:
-                                    pass
+                                    gpu_ctx = cuda_allocator.get_or_create_context(gpu_id)
+                                    cuda_allocator.libcuda.cuCtxSetCurrent(gpu_ctx)
+                                    cuda_allocator.free(item["handle"], item["device_ptr"], item["size_bytes"])
+                                    logger.info(f"Successfully freed {k} on GPU {gpu_id}")
+                                except Exception as e:
+                                    logger.error(f"Failed to free allocation {k} on GPU {gpu_id}: {e}")
                                     
-                        # Pop relocated allocations from tracking
-                        if k != buffer_id:
-                            ALLOCATED_BUFFERS.pop(k, None)
-                            
-                    ALLOCATED_BUFFERS.pop(buffer_id, None)
+                                if "fd" in item:
+                                    try:
+                                        os.close(item["fd"])
+                                    except OSError:
+                                        pass
+                                        
+                            if k != buffer_id:
+                                ALLOCATED_BUFFERS.pop(k, None)
+                                
+                        ALLOCATED_BUFFERS.pop(buffer_id, None)
                     logger.info(f"Fully cleared claims for buffer {buffer_id}.")
             else:
                 logger.warning(f"NodeUnstageWeight: buffer {buffer_id} for claim {claim_id} not found in tracking!")
@@ -667,121 +859,160 @@ class NodeService(wpi_pb2_grpc.NodeServiceServicer):
         try:
             if request.buffer_id not in ALLOCATED_BUFFERS:
                 raise Exception(f"Buffer {request.buffer_id} not found in local tracking.")
-                
-            if not CUPY_AVAILABLE:
-                raise Exception("cupy is not available. Cannot perform NCCL transfer.")
-                
-            info = ALLOCATED_BUFFERS[request.buffer_id]
-            device_ptr = info["device_ptr"]
-            size_bytes = info["size_bytes"]
-            num_elements = size_bytes // 2
             
-            # Phase 1: Pre-update signal to LOCAL consumers on source node.
-            # Source node consumers share the same VRAM buffer, so they need
-            # to know weights are about to change (e.g., flush KV cache).
-            # Target nodes get their signal in handle_target_connection().
+            info = ALLOCATED_BUFFERS[request.buffer_id]
+            source_fd = info["fd"]
+            size_bytes = info["size_bytes"]
+            
+            # Phase 1: Pre-update signal to local consumers
             send_pre_update_signal(request.buffer_id)
             
-            nccl_id_bytes = cupy.cuda.nccl.get_unique_id()
-            
-            target_ips = request.target_node_ids
-            num_targets = len(target_ips)
-            world_size = num_targets + 1
-            
-            logger.info(f"Source generated NCCL Unique ID. Connecting to {num_targets} targets (world_size={world_size})...")
-            
-            sockets = []
-            for i, target_ip in enumerate(target_ips):
-                rank = i + 1
-                logger.info(f"Connecting to target {target_ip} to assign rank {rank}...")
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.connect((target_ip, 50052))
+            if DRIVER_BACKEND == "tpu":
+                target_ips = request.target_node_ids
                 
-                # Build per-target scatter metadata if in SCATTER mode
-                scatter_meta = "0,0"  # offset,length placeholder
-                target_buffer_id = request.buffer_id
-                if propagate_mode == 1 and hasattr(request, 'shard_assignments') and request.shard_assignments:
-                    for assignment in request.shard_assignments:
-                        if assignment.target_node_id == target_ip:
-                            scatter_meta = f"{assignment.offset_bytes},{assignment.length_bytes}"
+                # We transfer chunks in parallel using ThreadPoolExecutor
+                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                    futures = []
+                    if propagate_mode == 1 and hasattr(request, 'shard_assignments') and request.shard_assignments:
+                        # SCATTER mode
+                        logger.info(f"TPU SCATTER: pushing shard assignments...")
+                        for assignment in request.shard_assignments:
+                            target_ip = assignment.target_node_id
+                            clean_ip = target_ip.split(":")[0]
+                            
+                            target_buffer_id = request.buffer_id
                             if "__shard_" in request.buffer_id:
                                 base_id = request.buffer_id.split("__shard_")[0]
                                 target_buffer_id = f"{base_id}__shard_{assignment.shard_index}"
-                            break
-                
-                # Send: buffer_id\nworld_size\nrank\nmode\nscatter_meta\nnccl_id_bytes
-                msg = f"{target_buffer_id}\n{world_size}\n{rank}\n{propagate_mode}\n{scatter_meta}\n".encode('utf-8') + nccl_id_bytes
-                s.sendall(msg)
-                
-                resp = s.recv(1024)
-                if b"OK" not in resp:
-                    raise Exception(f"Target node {target_ip} rejected NCCL preparation: {resp}")
-                
-                sockets.append(s)
-                
-            logger.info(f"Source (Rank 0) initializing NCCL comm...")
-            
-            # Wrap VMM device_ptr through cupy's memory management
-            # so NCCL can properly handle the pointer
-            mem = cupy.cuda.UnownedMemory(device_ptr, size_bytes, None)
-            memptr = cupy.cuda.MemoryPointer(mem, 0)
-            
-            with cupy.cuda.Device(info["gpu_id"]):
-                comm = cupy.cuda.nccl.NcclCommunicator(world_size, nccl_id_bytes, 0)
-                
-                start_time = time.time()
-                
-                if propagate_mode == 1 and hasattr(request, 'shard_assignments') and request.shard_assignments:
-                    # SCATTER mode: send different byte ranges to different targets
-                    logger.info(f"SCATTER mode: sending {len(request.shard_assignments)} shard assignments...")
-                    
-                    # Build rank map: target_node_id -> NCCL rank
-                    rank_map = {}
-                    for i, target_ip in enumerate(target_ips):
-                        rank_map[target_ip] = i + 1
-                    
-                    for assignment in request.shard_assignments:
-                        target_rank = rank_map.get(assignment.target_node_id)
-                        if target_rank is None:
-                            logger.warning(f"Shard assignment target {assignment.target_node_id} not in target list, skipping")
-                            continue
+                                
+                            f = executor.submit(
+                                push_tpu_chunk,
+                                clean_ip,
+                                target_buffer_id,
+                                assignment.offset_bytes,
+                                assignment.offset_bytes,
+                                assignment.length_bytes,
+                                source_fd
+                            )
+                            futures.append(f)
+                    else:
+                        # BROADCAST mode: push full buffer to all target IPs
+                        logger.info(f"TPU BROADCAST: pushing full buffer to all targets: {target_ips}...")
+                        for target_ip in target_ips:
+                            clean_ip = target_ip.split(":")[0]
+                            f = executor.submit(
+                                push_tpu_chunk,
+                                clean_ip,
+                                request.buffer_id,
+                                0,
+                                0,
+                                size_bytes,
+                                source_fd
+                            )
+                            futures.append(f)
+                            
+                    # Wait for all pushes to complete
+                    concurrent.futures.wait(futures)
+                    for f in futures:
+                        f.result() # raises exception if any push failed
                         
-                        offset = assignment.offset_bytes
-                        length = assignment.length_bytes
-                        shard_elements = length // 2  # fp16
-                        shard_ptr = memptr.ptr + offset
-                        
-                        logger.info(f"  Shard {assignment.shard_index}: sending {length} bytes "
-                                    f"(offset={offset}) to rank {target_rank} ({assignment.target_node_id})")
-                        comm.send(shard_ptr, shard_elements, cupy.cuda.nccl.NCCL_FLOAT16, target_rank, 0)
-                    
-                    cupy.cuda.Device(info["gpu_id"]).synchronize()
-                    logger.info(f"SCATTER: All shard sends completed.")
-                else:
-                    # BROADCAST mode (default): all targets get the same data
-                    logger.info(f"BROADCAST mode: sending full buffer to all {num_targets} targets...")
-                    comm.bcast(memptr.ptr, num_elements, cupy.cuda.nccl.NCCL_FLOAT16, 0, 0)
-                    cupy.cuda.Device(info["gpu_id"]).synchronize()
+                logger.info(f"TPU Propagation complete for '{request.buffer_id}'")
+            else:
+                if not CUPY_AVAILABLE:
+                    raise Exception("cupy is not available. Cannot perform NCCL transfer.")
                 
-            try:
-                comm.destroy()
-            except AttributeError:
-                pass
-            end_time = time.time()
-            
-            duration = end_time - start_time
-            # Total data moved out of this node is size_bytes, the switch fabric replicates it
-            bandwidth_gbps = (size_bytes / (1024**3)) / duration if duration > 0 else 0
-            logger.info(f"Source NCCL {mode_str} complete in {duration:.4f}s. Bandwidth: {bandwidth_gbps:.2f} GB/s")
-            
-            for s in sockets:
-                s.close()
+                device_ptr = info["device_ptr"]
+                num_elements = size_bytes // 2
+                nccl_id_bytes = cupy.cuda.nccl.get_unique_id()
+                
+                target_ips = request.target_node_ids
+                num_targets = len(target_ips)
+                world_size = num_targets + 1
+                
+                logger.info(f"Source generated NCCL Unique ID. Connecting to {num_targets} targets (world_size={world_size})...")
+                
+                sockets = []
+                for i, target_ip in enumerate(target_ips):
+                    rank = i + 1
+                    logger.info(f"Connecting to target {target_ip} to assign rank {rank}...")
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.connect((target_ip, 50052))
+                    
+                    # Build per-target scatter metadata if in SCATTER mode
+                    scatter_meta = "0,0"  # offset,length placeholder
+                    target_buffer_id = request.buffer_id
+                    if propagate_mode == 1 and hasattr(request, 'shard_assignments') and request.shard_assignments:
+                        for assignment in request.shard_assignments:
+                            if assignment.target_node_id == target_ip:
+                                scatter_meta = f"{assignment.offset_bytes},{assignment.length_bytes}"
+                                if "__shard_" in request.buffer_id:
+                                    base_id = request.buffer_id.split("__shard_")[0]
+                                    target_buffer_id = f"{base_id}__shard_{assignment.shard_index}"
+                                break
+                    
+                    # Send: buffer_id\nworld_size\nrank\nmode\nscatter_meta\nnccl_id_bytes
+                    msg = f"{target_buffer_id}\n{world_size}\n{rank}\n{propagate_mode}\n{scatter_meta}\n".encode('utf-8') + nccl_id_bytes
+                    s.sendall(msg)
+                    
+                    resp = s.recv(1024)
+                    if b"OK" not in resp:
+                        raise Exception(f"Target node {target_ip} rejected NCCL preparation: {resp}")
+                    
+                    sockets.append(s)
+                    
+                logger.info(f"Source (Rank 0) initializing NCCL comm...")
+                
+                # Wrap VMM device_ptr through cupy's memory management
+                mem = cupy.cuda.UnownedMemory(device_ptr, size_bytes, None)
+                memptr = cupy.cuda.MemoryPointer(mem, 0)
+                
+                with cupy.cuda.Device(info["gpu_id"]):
+                    comm = cupy.cuda.nccl.NcclCommunicator(world_size, nccl_id_bytes, 0)
+                    start_time = time.time()
+                    
+                    if propagate_mode == 1 and hasattr(request, 'shard_assignments') and request.shard_assignments:
+                        logger.info(f"SCATTER mode: sending {len(request.shard_assignments)} shard assignments...")
+                        rank_map = {}
+                        for i, target_ip in enumerate(target_ips):
+                            rank_map[target_ip] = i + 1
+                        
+                        for assignment in request.shard_assignments:
+                            target_rank = rank_map.get(assignment.target_node_id)
+                            if target_rank is None:
+                                logger.warning(f"Shard assignment target {assignment.target_node_id} not in target list, skipping")
+                                continue
+                            
+                            offset = assignment.offset_bytes
+                            length = assignment.length_bytes
+                            shard_elements = length // 2  # fp16
+                            shard_ptr = memptr.ptr + offset
+                            
+                            logger.info(f"  Shard {assignment.shard_index}: sending {length} bytes "
+                                        f"(offset={offset}) to rank {target_rank} ({assignment.target_node_id})")
+                            comm.send(shard_ptr, shard_elements, cupy.cuda.nccl.NCCL_FLOAT16, target_rank, 0)
+                        
+                        cupy.cuda.Device(info["gpu_id"]).synchronize()
+                        logger.info(f"SCATTER: All shard sends completed.")
+                    else:
+                        logger.info(f"BROADCAST mode: sending full buffer to all {num_targets} targets...")
+                        comm.bcast(memptr.ptr, num_elements, cupy.cuda.nccl.NCCL_FLOAT16, 0, 0)
+                        cupy.cuda.Device(info["gpu_id"]).synchronize()
+                    
+                try:
+                    comm.destroy()
+                except AttributeError:
+                    pass
+                end_time = time.time()
+                
+                duration = end_time - start_time
+                bandwidth_gbps = (size_bytes / (1024**3)) / duration if duration > 0 else 0
+                logger.info(f"Source NCCL {mode_str} complete in {duration:.4f}s. Bandwidth: {bandwidth_gbps:.2f} GB/s")
+                
+                for s in sockets:
+                    s.close()
             
             # Send READY to local consumers on the SOURCE node.
-            # When rollout workers are co-located with the trainer, they
-            # share the same VMM buffer (same FD from same driver). The data
-            # is already there after send_weights() packs it. They just need
-            # the READY signal to proceed.
+            info["ready"] = True
             notify_sockets = info.get("notify_sockets", [])
             broken_sockets = []
             for s in notify_sockets:
@@ -818,8 +1049,12 @@ class IdentityService(wpi_pb2_grpc.IdentityServiceServicer):
         ])
 
 def serve():
-    target_server_thread = threading.Thread(target=start_nccl_target_server, daemon=True)
-    target_server_thread.start()
+    if DRIVER_BACKEND == "tpu":
+        tpu_server_thread = threading.Thread(target=start_tpu_receiver_server, daemon=True)
+        tpu_server_thread.start()
+    else:
+        target_server_thread = threading.Thread(target=start_nccl_target_server, daemon=True)
+        target_server_thread.start()
 
     server = grpc.server(concurrent.futures.ThreadPoolExecutor(max_workers=10))
     wpi_pb2_grpc.add_NodeServiceServicer_to_server(NodeService(), server)
@@ -827,15 +1062,15 @@ def serve():
     
     port = "50051"
     server.add_insecure_port('[::]:50051')
-    server.add_insecure_port('unix:///run/wpi/sockets/wpi-grpc.sock')
+    grpc_sock_path = os.path.join(SOCKET_DIR, 'wpi-grpc.sock')
+    server.add_insecure_port(f'unix://{grpc_sock_path}')
     server.start()
-    logger.info("WPI Driver starting on unix:///run/wpi/sockets/wpi-grpc.sock...")
+    logger.info(f"WPI Driver starting on unix://{grpc_sock_path}...")
     try:
-        import os
-        os.chmod('/run/wpi/sockets/wpi-grpc.sock', 0o777)
-        logger.info("Successfully changed permissions of /run/wpi/sockets/wpi-grpc.sock to 777")
+        os.chmod(grpc_sock_path, 0o777)
+        logger.info(f"Successfully changed permissions of {grpc_sock_path} to 777")
     except Exception as e:
-        logger.warning(f"Failed to change permissions of /run/wpi/sockets/wpi-grpc.sock: {e}")
+        logger.warning(f"Failed to change permissions of {grpc_sock_path}: {e}")
     server.wait_for_termination()
 
 if __name__ == "__main__":

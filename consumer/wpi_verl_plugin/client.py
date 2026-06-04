@@ -31,11 +31,13 @@ Usage:
 import array
 import ctypes
 import logging
+import mmap
 import os
 import socket
 import time
 from typing import Optional
 
+import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
@@ -121,11 +123,257 @@ def _find_libcuda() -> ctypes.CDLL:
     )
 
 
+class WpiBackend:
+    def __init__(self, client: "WPIClient"):
+        self.client = client
+
+    def map_memory(self, buffer_id: str, size_bytes: int, **kwargs) -> any:
+        raise NotImplementedError
+
+    def close(self):
+        pass
+
+
+class CudaWpiBackend(WpiBackend):
+    def __init__(self, client: "WPIClient"):
+        super().__init__(client)
+        self._libcuda = None
+        self._cuda_ctx = None
+        self._cuda_device = None
+
+    def map_memory(
+        self,
+        buffer_id: str,
+        size_bytes: int,
+        device_id: int = 0,
+        gpu_id: int = 0,
+        shard_index: int = -1,
+        total_shards: int = 0,
+        **kwargs,
+    ) -> torch.Tensor:
+        fd = self.client.receive_fd(
+            buffer_id, gpu_id=gpu_id, shard_index=shard_index, total_shards=total_shards
+        )
+        device_ptr = self.import_cuda_memory(fd, size_bytes, device_id=device_id)
+        return self.wrap_as_buffer(device_ptr, size_bytes)
+
+    def _init_cuda_context(self, device_id: int = 0):
+        if self._libcuda is not None:
+            return
+
+        logger.debug(f"WPI: _init_cuda_context called for device {device_id}")
+        logger.debug(f"WPI: torch.cuda.is_initialized() = {torch.cuda.is_initialized()}")
+        if torch.cuda.is_initialized():
+            logger.debug(f"WPI: torch.cuda.current_device() = {torch.cuda.current_device()}")
+
+        self._libcuda = _find_libcuda()
+
+        # Bind cuCtxGetCurrent
+        self._libcuda.cuCtxGetCurrent.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        self._libcuda.cuCtxGetCurrent.restype = ctypes.c_int
+
+        # Bind cuCtxPushCurrent and cuCtxPopCurrent
+        self._libcuda.cuCtxPushCurrent.argtypes = [ctypes.c_void_p]
+        self._libcuda.cuCtxPushCurrent.restype = ctypes.c_int
+        self._libcuda.cuCtxPopCurrent.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        self._libcuda.cuCtxPopCurrent.restype = ctypes.c_int
+
+        current_ctx = ctypes.c_void_p()
+        err = self._libcuda.cuCtxGetCurrent(ctypes.byref(current_ctx))
+        if err == 0:
+            logger.debug(f"WPI: Current CUDA context BEFORE init: {current_ctx.value}")
+        else:
+            logger.warning(f"WPI: cuCtxGetCurrent failed with error code {err}")
+
+        err = self._libcuda.cuInit(0)
+        if err != 0:
+            raise RuntimeError(f"cuInit failed with error code {err}")
+
+        device = ctypes.c_int()
+        err = self._libcuda.cuDeviceGet(ctypes.byref(device), device_id)
+        if err != 0:
+            raise RuntimeError(f"cuDeviceGet({device_id}) failed with error code {err}")
+        self._cuda_device = device
+
+        ctx = ctypes.c_void_p()
+        err = self._libcuda.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), device)
+        if err != 0:
+            raise RuntimeError(f"cuDevicePrimaryCtxRetain({device_id}) failed with error code {err}")
+        logger.debug(f"WPI: Retained primary context: {ctx.value}")
+
+        current_ctx = ctypes.c_void_p()
+        self._libcuda.cuCtxGetCurrent(ctypes.byref(current_ctx))
+
+        self.pushed_context = False
+        if current_ctx.value != ctx.value:
+            err = self._libcuda.cuCtxPushCurrent(ctx)
+            if err != 0:
+                raise RuntimeError(f"cuCtxPushCurrent failed with error code {err}")
+            self.pushed_context = True
+            logger.debug("WPI: Pushed primary context successfully.")
+        else:
+            logger.debug("WPI: Context is already current, skipping push.")
+
+        self._cuda_ctx = ctx
+
+        # Check current context again
+        err = self._libcuda.cuCtxGetCurrent(ctypes.byref(current_ctx))
+        if err == 0:
+            logger.debug(f"WPI: Current CUDA context AFTER init: {current_ctx.value}")
+
+    def import_cuda_memory(self, fd: int, size_bytes: int, device_id: int = 0) -> int:
+        self._init_cuda_context(device_id)
+        libcuda = self._libcuda
+
+        # 0. Query allocation granularity — must align size to match driver's allocation
+        prop = CUmemAllocationProp()
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE
+        prop.location.id = self._cuda_device.value
+        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+
+        granularity = ctypes.c_size_t()
+        err = libcuda.cuMemGetAllocationGranularity(
+            ctypes.byref(granularity), ctypes.byref(prop), CU_MEM_ALLOC_GRANULARITY_MINIMUM
+        )
+        if err != 0:
+            logger.warning(f"cuMemGetAllocationGranularity failed ({err}), using default 2MB")
+            gran = 2 * 1024 * 1024  # 2 MB default
+        else:
+            gran = granularity.value
+
+        # Align size up to granularity (must match what driver did during cuMemCreate)
+        if size_bytes % gran != 0:
+            aligned_size = ((size_bytes // gran) + 1) * gran
+        else:
+            aligned_size = size_bytes
+        logger.debug(
+            f"WPI: import_cuda_memory fd={fd} size={size_bytes} aligned={aligned_size} gran={gran} gpu={device_id}"
+        )
+
+        # 1. Import the shareable handle
+        handle = ctypes.c_ulonglong()
+        err = libcuda.cuMemImportFromShareableHandle(
+            ctypes.byref(handle),
+            ctypes.c_void_p(fd),
+            CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+        )
+        if err != 0:
+            raise RuntimeError(f"cuMemImportFromShareableHandle failed with error code {err}")
+        logger.debug(f"WPI: Imported shareable handle, generic handle: {handle.value}")
+
+        # 2. Reserve virtual address space
+        device_ptr = ctypes.c_ulonglong()
+        err = libcuda.cuMemAddressReserve(
+            ctypes.byref(device_ptr),
+            ctypes.c_size_t(aligned_size),
+            ctypes.c_size_t(gran),  # alignment = granularity
+            ctypes.c_ulonglong(0),  # addr hint
+            ctypes.c_ulonglong(0),  # flags
+        )
+        if err != 0:
+            raise RuntimeError(f"cuMemAddressReserve failed with error code {err}")
+
+        # 3. Map the handle to the address
+        current_ctx = ctypes.c_void_p()
+        err = libcuda.cuCtxGetCurrent(ctypes.byref(current_ctx))
+        if err == 0:
+            logger.debug(f"WPI: Current CUDA context before cuMemMap: {current_ctx.value}")
+        else:
+            logger.warning(f"WPI: cuCtxGetCurrent failed before cuMemMap with error code {err}")
+
+        try:
+            err = libcuda.cuMemMap(
+                device_ptr,
+                ctypes.c_size_t(aligned_size),
+                ctypes.c_size_t(0),  # offset
+                handle,
+                ctypes.c_ulonglong(0),  # flags
+            )
+            if err != 0:
+                logger.error(
+                    f"WPI: cuMemMap failed err={err}, "
+                    f"size={aligned_size}, handle={handle.value}, ptr={device_ptr.value}"
+                )
+                raise RuntimeError(f"cuMemMap failed with error code {err}")
+        except Exception as e:
+            logger.error(
+                f"WPI: cuMemMap exception: {e}, size={aligned_size}, handle={handle.value}, ptr={device_ptr.value}"
+            )
+            raise
+        logger.debug(f"WPI: cuMemMap succeeded on ptr {device_ptr.value}")
+
+        # 4. Set access permissions
+        desc = CUmemAccessDesc()
+        desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE
+        desc.location.id = self._cuda_device.value
+        desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+
+        err = libcuda.cuMemSetAccess(
+            device_ptr,
+            ctypes.c_size_t(aligned_size),
+            ctypes.byref(desc),
+            ctypes.c_size_t(1),
+        )
+        if err != 0:
+            raise RuntimeError(f"cuMemSetAccess failed with error code {err}")
+
+        # Pop context if we pushed it in _init_cuda_context
+        if getattr(self, "pushed_context", False):
+            pctx_pop = ctypes.c_void_p()
+            err = libcuda.cuCtxPopCurrent(ctypes.byref(pctx_pop))
+            if err != 0:
+                raise RuntimeError(f"cuCtxPopCurrent failed with error code {err}")
+            logger.debug("WPI: Popped custom map context successfully.")
+
+        logger.info(f"WPI: CUDA memory mapped at device_ptr {device_ptr.value}, size {aligned_size}")
+        return device_ptr.value
+
+    def wrap_as_buffer(self, device_ptr: int, size_bytes: int) -> torch.Tensor:
+        raw = RawCUDATensor(device_ptr, size_bytes)
+        tensor = torch.as_tensor(raw, device=torch.device("cuda"))
+        return tensor
+
+
+class TpuWpiBackend(WpiBackend):
+    def __init__(self, client: "WPIClient"):
+        super().__init__(client)
+        self.mappings = {}
+
+    def map_memory(
+        self,
+        buffer_id: str,
+        size_bytes: int,
+        shard_index: int = -1,
+        total_shards: int = 0,
+        **kwargs,
+    ) -> np.ndarray:
+        # 1. Receive the file descriptor from driver daemon
+        fd = self.client.receive_fd(
+            buffer_id, gpu_id=0, shard_index=shard_index, total_shards=total_shards
+        )
+
+        # 2. Memory-map the FD to our host address space using POSIX mmap
+        m = mmap.mmap(fd, size_bytes, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+        self.mappings[buffer_id] = m
+
+        # 3. Expose the mapped buffer as a zero-copy numpy array (backed by shared memory)
+        return np.frombuffer(m, dtype=np.uint8)
+
+    def close(self):
+        for m in self.mappings.values():
+            try:
+                m.close()
+            except Exception:
+                pass
+        self.mappings.clear()
+
+
 class WPIClient:
     """Client for interacting with the WPI driver on the local node.
 
     Handles gRPC calls to the WPI driver, UNIX socket FD passing for
-    CUDA memory sharing, and notification synchronization.
+    shared memory / CUDA memory, and notification synchronization.
 
     Args:
         socket_dir: Path to the directory containing WPI UNIX sockets.
@@ -146,9 +394,20 @@ class WPIClient:
         self._grpc_channel = None
         self._grpc_stub = None
         self._notify_socket: Optional[socket.socket] = None
-        self._libcuda: Optional[ctypes.CDLL] = None
-        self._cuda_ctx = None
-        self._cuda_device = None
+
+        # Auto-detect backend based on hardware
+        self.backend_type = os.environ.get("WPI_BACKEND")
+        if not self.backend_type:
+            if os.path.exists("/dev/accel0") or os.environ.get("TPU_NAME"):
+                self.backend_type = "tpu"
+            else:
+                self.backend_type = "cuda"
+
+        logger.info(f"WPI: Initialized client using {self.backend_type.upper()} backend")
+        if self.backend_type == "tpu":
+            self.backend = TpuWpiBackend(self)
+        else:
+            self.backend = CudaWpiBackend(self)
 
     def _get_grpc_stub(self):
         """Lazily create gRPC channel and stub for NodeService."""
@@ -381,211 +640,9 @@ class WPIClient:
         logger.info(f"WPI: Received FD {fd} for buffer '{effective_id}' on GPU {gpu_id}")
         return fd
 
-    def _init_cuda_context(self, device_id: int = 0):
-        """Initialize CUDA driver context if not already done."""
-        if self._libcuda is not None:
-            return
-
-        logger.debug(f"WPI: _init_cuda_context called for device {device_id}")
-        logger.debug(f"WPI: torch.cuda.is_initialized() = {torch.cuda.is_initialized()}")
-        if torch.cuda.is_initialized():
-            logger.debug(f"WPI: torch.cuda.current_device() = {torch.cuda.current_device()}")
-
-        self._libcuda = _find_libcuda()
-
-        # Bind cuCtxGetCurrent
-        self._libcuda.cuCtxGetCurrent.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
-        self._libcuda.cuCtxGetCurrent.restype = ctypes.c_int
-
-        # Bind cuCtxPushCurrent and cuCtxPopCurrent
-        self._libcuda.cuCtxPushCurrent.argtypes = [ctypes.c_void_p]
-        self._libcuda.cuCtxPushCurrent.restype = ctypes.c_int
-        self._libcuda.cuCtxPopCurrent.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
-        self._libcuda.cuCtxPopCurrent.restype = ctypes.c_int
-
-        current_ctx = ctypes.c_void_p()
-        err = self._libcuda.cuCtxGetCurrent(ctypes.byref(current_ctx))
-        if err == 0:
-            logger.debug(f"WPI: Current CUDA context BEFORE init: {current_ctx.value}")
-        else:
-            logger.warning(f"WPI: cuCtxGetCurrent failed with error code {err}")
-
-        err = self._libcuda.cuInit(0)
-        if err != 0:
-            raise RuntimeError(f"cuInit failed with error code {err}")
-
-        device = ctypes.c_int()
-        err = self._libcuda.cuDeviceGet(ctypes.byref(device), device_id)
-        if err != 0:
-            raise RuntimeError(f"cuDeviceGet({device_id}) failed with error code {err}")
-        self._cuda_device = device
-
-        ctx = ctypes.c_void_p()
-        err = self._libcuda.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), device)
-        if err != 0:
-            raise RuntimeError(f"cuDevicePrimaryCtxRetain({device_id}) failed with error code {err}")
-        logger.debug(f"WPI: Retained primary context: {ctx.value}")
-
-        current_ctx = ctypes.c_void_p()
-        self._libcuda.cuCtxGetCurrent(ctypes.byref(current_ctx))
-
-        self.pushed_context = False
-        if current_ctx.value != ctx.value:
-            err = self._libcuda.cuCtxPushCurrent(ctx)
-            if err != 0:
-                raise RuntimeError(f"cuCtxPushCurrent failed with error code {err}")
-            self.pushed_context = True
-            logger.debug("WPI: Pushed primary context successfully.")
-        else:
-            logger.debug("WPI: Context is already current, skipping push.")
-
-        self._cuda_ctx = ctx
-
-        # Check current context again
-        err = self._libcuda.cuCtxGetCurrent(ctypes.byref(current_ctx))
-        if err == 0:
-            logger.debug(f"WPI: Current CUDA context AFTER init: {current_ctx.value}")
-
-    def import_cuda_memory(self, fd: int, size_bytes: int, device_id: int = 0) -> int:
-        """Import a POSIX file descriptor as CUDA memory and map it.
-
-        Performs the CUDA VMM (Virtual Memory Management) sequence:
-        1. cuMemImportFromShareableHandle — import the FD as a generic handle
-        2. Query allocation granularity and align size
-        3. cuMemAddressReserve — reserve virtual address space
-        4. cuMemMap — map the handle to the reserved address
-        5. cuMemSetAccess — set read/write permissions
-
-        Args:
-            fd: The POSIX file descriptor from receive_fd().
-            size_bytes: Size of the memory region.
-            device_id: CUDA device to map on.
-
-        Returns:
-            Device pointer (int) to the mapped memory.
-        """
-        self._init_cuda_context(device_id)
-        libcuda = self._libcuda
-
-        # 0. Query allocation granularity — must align size to match driver's allocation
-        prop = CUmemAllocationProp()
-        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED
-        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE
-        prop.location.id = self._cuda_device.value
-        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-
-        granularity = ctypes.c_size_t()
-        err = libcuda.cuMemGetAllocationGranularity(
-            ctypes.byref(granularity), ctypes.byref(prop), CU_MEM_ALLOC_GRANULARITY_MINIMUM
-        )
-        if err != 0:
-            logger.warning(f"cuMemGetAllocationGranularity failed ({err}), using default 2MB")
-            gran = 2 * 1024 * 1024  # 2 MB default
-        else:
-            gran = granularity.value
-
-        # Align size up to granularity (must match what driver did during cuMemCreate)
-        if size_bytes % gran != 0:
-            aligned_size = ((size_bytes // gran) + 1) * gran
-        else:
-            aligned_size = size_bytes
-        logger.debug(
-            f"WPI: import_cuda_memory fd={fd} size={size_bytes} aligned={aligned_size} gran={gran} gpu={device_id}"
-        )
-
-        # 1. Import the shareable handle
-        handle = ctypes.c_ulonglong()
-        err = libcuda.cuMemImportFromShareableHandle(
-            ctypes.byref(handle),
-            ctypes.c_void_p(fd),
-            CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
-        )
-        if err != 0:
-            raise RuntimeError(f"cuMemImportFromShareableHandle failed with error code {err}")
-        logger.debug(f"WPI: Imported shareable handle, generic handle: {handle.value}")
-
-        # 2. Reserve virtual address space
-        device_ptr = ctypes.c_ulonglong()
-        err = libcuda.cuMemAddressReserve(
-            ctypes.byref(device_ptr),
-            ctypes.c_size_t(aligned_size),
-            ctypes.c_size_t(gran),  # alignment = granularity
-            ctypes.c_ulonglong(0),  # addr hint
-            ctypes.c_ulonglong(0),  # flags
-        )
-        if err != 0:
-            raise RuntimeError(f"cuMemAddressReserve failed with error code {err}")
-
-        # 3. Map the handle to the address
-        current_ctx = ctypes.c_void_p()
-        err = libcuda.cuCtxGetCurrent(ctypes.byref(current_ctx))
-        if err == 0:
-            logger.debug(f"WPI: Current CUDA context before cuMemMap: {current_ctx.value}")
-        else:
-            logger.warning(f"WPI: cuCtxGetCurrent failed before cuMemMap with error code {err}")
-
-        try:
-            err = libcuda.cuMemMap(
-                device_ptr,
-                ctypes.c_size_t(aligned_size),
-                ctypes.c_size_t(0),  # offset
-                handle,
-                ctypes.c_ulonglong(0),  # flags
-            )
-            if err != 0:
-                logger.error(
-                    f"WPI: cuMemMap failed err={err}, "
-                    f"size={aligned_size}, handle={handle.value}, ptr={device_ptr.value}"
-                )
-                raise RuntimeError(f"cuMemMap failed with error code {err}")
-        except Exception as e:
-            logger.error(
-                f"WPI: cuMemMap exception: {e}, size={aligned_size}, handle={handle.value}, ptr={device_ptr.value}"
-            )
-            raise
-        logger.debug(f"WPI: cuMemMap succeeded on ptr {device_ptr.value}")
-
-        # 4. Set access permissions
-        desc = CUmemAccessDesc()
-        desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE
-        desc.location.id = self._cuda_device.value
-        desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-
-        err = libcuda.cuMemSetAccess(
-            device_ptr,
-            ctypes.c_size_t(aligned_size),
-            ctypes.byref(desc),
-            ctypes.c_size_t(1),
-        )
-        if err != 0:
-            raise RuntimeError(f"cuMemSetAccess failed with error code {err}")
-
-        # Pop context if we pushed it in _init_cuda_context
-        if getattr(self, "pushed_context", False):
-            pctx_pop = ctypes.c_void_p()
-            err = libcuda.cuCtxPopCurrent(ctypes.byref(pctx_pop))
-            if err != 0:
-                raise RuntimeError(f"cuCtxPopCurrent failed with error code {err}")
-            logger.debug("WPI: Popped custom map context successfully.")
-
-        logger.info(f"WPI: CUDA memory mapped at device_ptr {device_ptr.value}, size {aligned_size}")
-        return device_ptr.value
-
-    def wrap_as_buffer(self, device_ptr: int, size_bytes: int) -> torch.Tensor:
-        """Wrap a raw CUDA device pointer as a PyTorch uint8 tensor.
-
-        Uses __cuda_array_interface__ for zero-copy wrapping.
-
-        Args:
-            device_ptr: Raw CUDA device pointer.
-            size_bytes: Size of the buffer.
-
-        Returns:
-            A PyTorch tensor (uint8, 1D) backed by the device memory.
-        """
-        raw = RawCUDATensor(device_ptr, size_bytes)
-        tensor = torch.as_tensor(raw, device=torch.device("cuda"))
-        return tensor
+    def map_memory(self, buffer_id: str, size_bytes: int, **kwargs) -> any:
+        """Map the staged memory buffer into user process address space."""
+        return self.backend.map_memory(buffer_id, size_bytes, **kwargs)
 
     def connect_notify_socket(
         self, buffer_id: str, timeout: float = 60.0,
@@ -643,18 +700,34 @@ class WPIClient:
         if self._notify_socket is None:
             raise RuntimeError("WPI: Notify socket not connected. Call connect_notify_socket() first.")
 
-        self._notify_socket.settimeout(timeout)
-        try:
-            data = self._notify_socket.recv(1024)
-            if b"READY" in data:
-                logger.info("WPI: Received READY notification from driver")
-            else:
-                logger.warning(f"WPI: Unexpected notification data: {data}")
-        except TimeoutError:
-            raise TimeoutError(f"WPI: Did not receive READY notification within {timeout}s") from None
+        start_time = time.time()
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed >= timeout:
+                raise TimeoutError(f"WPI: Did not receive READY notification within {timeout}s")
+            
+            self._notify_socket.settimeout(timeout - elapsed)
+            try:
+                data = self._notify_socket.recv(1024)
+                if not data:
+                    raise ConnectionAbortedError("WPI: Notify socket closed by driver.")
+                if b"READY" in data:
+                    logger.info("WPI: Received READY notification from driver")
+                    return
+                elif b"PRE_UPDATE" in data:
+                    logger.info("WPI: Received PRE_UPDATE notification from driver, waiting for READY...")
+                else:
+                    logger.warning(f"WPI: Unexpected notification data: {data}")
+            except TimeoutError:
+                raise TimeoutError(f"WPI: Did not receive READY notification within {timeout}s") from None
 
     def close(self):
         """Clean up connections."""
+        if hasattr(self, "backend") and self.backend:
+            try:
+                self.backend.close()
+            except Exception:
+                pass
         if self._notify_socket is not None:
             try:
                 self._notify_socket.close()

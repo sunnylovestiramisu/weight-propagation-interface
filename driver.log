@@ -1,0 +1,41 @@
+2026-06-03 17:18:58,044 - WARNING - Could not initialize CudaAllocator (fallback to mock): /usr/local/nvidia/lib64/libcuda.so.1: cannot open shared object file: No such file or directory
+2026-06-03 17:18:58,044 - INFO - WPI Driver starting in TPU backend mode
+2026-06-03 17:18:58,045 - INFO - WPI TPU Receiver Server listening on 0.0.0.0:50053
+2026-06-03 17:18:58,052 - INFO - WPI Driver starting on unix:///tmp/wpi_sockets/wpi-grpc.sock...
+2026-06-03 17:18:58,052 - INFO - Successfully changed permissions of /tmp/wpi_sockets/wpi-grpc.sock to 777
+2026-06-03 17:19:01,341 - INFO - NodeStageWeight called for claim: claim-source, buffer: wb-tpu-test, effective_id: wb-tpu-test__shard_0, shard: 0/2
+2026-06-03 17:19:01,341 - INFO - TPU Stage: Allocating shared memory file /dev/shm/wpi-wb-tpu-test__shard_0 (10485760 bytes)...
+2026-06-03 17:19:01,342 - INFO - No source_path specified. Allocating empty shared memory locally.
+2026-06-03 17:19:01,342 - INFO - Starting FD passing server for buffer wb-tpu-test__shard_0
+2026-06-03 17:19:01,343 - INFO - FD passing server listening on /tmp/wpi_sockets/wb-tpu-test__shard_0.sock for buffer wb-tpu-test__shard_0
+2026-06-03 17:19:01,343 - INFO - Notify passing server listening on /tmp/wpi_sockets/wb-tpu-test__shard_0_notify.sock
+2026-06-03 17:19:01,343 - INFO - NodeStageWeight called for claim: claim-target, buffer: wb-tpu-test, effective_id: wb-tpu-test__shard_1, shard: 1/2
+2026-06-03 17:19:01,344 - INFO - TPU Stage: Allocating shared memory file /dev/shm/wpi-wb-tpu-test__shard_1 (10485760 bytes)...
+2026-06-03 17:19:01,344 - INFO - No source_path specified. Allocating empty shared memory locally.
+2026-06-03 17:19:01,344 - INFO - Starting FD passing server for buffer wb-tpu-test__shard_1
+2026-06-03 17:19:01,345 - INFO - Notify passing server listening on /tmp/wpi_sockets/wb-tpu-test__shard_1_notify.sock
+2026-06-03 17:19:01,345 - INFO - FD passing server listening on /tmp/wpi_sockets/wb-tpu-test__shard_1.sock for buffer wb-tpu-test__shard_1
+2026-06-03 17:19:01,345 - INFO - Consumer connected to notify socket /tmp/wpi_sockets/wb-tpu-test__shard_1_notify.sock.
+2026-06-03 17:19:01,345 - INFO - Client connected to /tmp/wpi_sockets/wb-tpu-test__shard_0.sock. Reading metadata...
+2026-06-03 17:19:01,345 - INFO - Client requested absolute GPU ID: 0
+2026-06-03 17:19:01,345 - INFO - Sending FD 14 to client.
+2026-06-03 17:19:02,403 - INFO - NodePropagate called for buffer: wb-tpu-test__shard_0 to [127.0.0.1] mode=SCATTER
+2026-06-03 17:19:02,403 - INFO - TPU SCATTER: pushing shard assignments...
+2026-06-03 17:19:02,404 - INFO - TPU Receiver: receiving 10485760 bytes for wb-tpu-test__shard_1 at offset 0 from ('127.0.0.1', 48456)
+2026-06-03 17:19:02,414 - INFO - TPU Push Client: pushed 10485760 bytes to 127.0.0.1 (dst_offset=0)
+2026-06-03 17:19:02,415 - INFO - TPU Propagation complete for 'wb-tpu-test__shard_0'
+2026-06-03 17:19:02,417 - INFO - TPU Receiver: successfully wrote 10485760 bytes for wb-tpu-test__shard_1
+2026-06-03 17:19:02,417 - INFO - TPU Receiver: Sent READY notification to consumer.
+2026-06-03 17:19:02,417 - INFO - Client connected to /tmp/wpi_sockets/wb-tpu-test__shard_1.sock. Reading metadata...
+2026-06-03 17:19:02,417 - INFO - Client requested absolute GPU ID: 0
+2026-06-03 17:19:02,417 - INFO - Sending FD 20 to client.
+2026-06-03 17:19:02,423 - INFO - NodeUnstageWeight called for claim: claim-source
+2026-06-03 17:19:02,423 - INFO - Decremented ref_count for wb-tpu-test__shard_0 to 0
+2026-06-03 17:19:02,423 - INFO - Ref count for wb-tpu-test__shard_0 is 0. Freeing all related allocations...
+2026-06-03 17:19:02,423 - INFO - Successfully freed shared memory buffer wb-tpu-test__shard_0
+2026-06-03 17:19:02,423 - INFO - Fully cleared claims for buffer wb-tpu-test__shard_0.
+2026-06-03 17:19:02,424 - INFO - NodeUnstageWeight called for claim: claim-target
+2026-06-03 17:19:02,424 - INFO - Decremented ref_count for wb-tpu-test__shard_1 to 0
+2026-06-03 17:19:02,424 - INFO - Ref count for wb-tpu-test__shard_1 is 0. Freeing all related allocations...
+2026-06-03 17:19:02,424 - INFO - Successfully freed shared memory buffer wb-tpu-test__shard_1
+2026-06-03 17:19:02,424 - INFO - Fully cleared claims for buffer wb-tpu-test__shard_1.
